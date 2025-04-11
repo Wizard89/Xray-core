@@ -3,8 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"google.golang.org/protobuf/encoding/protojson"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/xtls/xray-core/common/buf"
+	creflect "github.com/xtls/xray-core/common/reflect"
 	"github.com/xtls/xray-core/main/commands/base"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -37,7 +40,7 @@ func setSharedFlags(cmd *base.Command) {
 
 func dialAPIServer() (conn *grpc.ClientConn, ctx context.Context, close func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(apiTimeout)*time.Second)
-	conn, err := grpc.DialContext(ctx, apiServerAddrPtr, grpc.WithInsecure(), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, apiServerAddrPtr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		base.Fatalf("failed to dial %s", apiServerAddrPtr)
 	}
@@ -99,26 +102,22 @@ func fetchHTTPContent(target string) ([]byte, error) {
 
 	content, err := buf.ReadAllToBytes(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read HTTP response")
+		return nil, errors.New("failed to read HTTP response")
 	}
 
 	return content, nil
-}
-
-func protoToJSONString(m proto.Message, prefix, indent string) (string, error) {
-	return strings.TrimSpace(protojson.MarshalOptions{Indent: indent}.Format(m)), nil
 }
 
 func showJSONResponse(m proto.Message) {
 	if isNil(m) {
 		return
 	}
-	output, err := protoToJSONString(m, "", "    ")
-	if err != nil {
+	if j, ok := creflect.MarshalToJson(m, true); ok {
+		fmt.Println(j)
+	} else {
 		fmt.Fprintf(os.Stdout, "%v\n", m)
-		base.Fatalf("error encode json: %s", err)
+		base.Fatalf("error encode json")
 	}
-	fmt.Println(output)
 }
 
 func isNil(i interface{}) bool {

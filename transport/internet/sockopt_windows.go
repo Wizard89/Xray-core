@@ -5,6 +5,8 @@ import (
 	"net"
 	"syscall"
 	"unsafe"
+
+	"github.com/xtls/xray-core/common/errors"
 )
 
 const (
@@ -29,19 +31,25 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 	if config.Interface != "" {
 		inf, err := net.InterfaceByName(config.Interface)
 		if err != nil {
-			return newError("failed to find the interface").Base(err)
+			return errors.New("failed to find the interface").Base(err)
 		}
-		isV4 := (network == "tcp4")
+		isV4 := (network == "tcp4" || network == "udp4")
 		if isV4 {
 			var bytes [4]byte
 			binary.BigEndian.PutUint32(bytes[:], uint32(inf.Index))
 			idx := *(*uint32)(unsafe.Pointer(&bytes[0]))
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, IP_UNICAST_IF, int(idx)); err != nil {
-				return newError("failed to set IP_UNICAST_IF").Base(err)
+				return errors.New("failed to set IP_UNICAST_IF").Base(err)
+			}
+			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, int(idx)); err != nil {
+				return errors.New("failed to set IP_MULTICAST_IF").Base(err)
 			}
 		} else {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IPV6, IPV6_UNICAST_IF, inf.Index); err != nil {
-				return newError("failed to set IPV6_UNICAST_IF").Base(err)
+				return errors.New("failed to set IPV6_UNICAST_IF").Base(err)
+			}
+			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IPV6, syscall.IPV6_MULTICAST_IF, inf.Index); err != nil {
+				return errors.New("failed to set IPV6_MULTICAST_IF").Base(err)
 			}
 		}
 	}
@@ -52,16 +60,11 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 		}
 		if config.TcpKeepAliveIdle > 0 {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1); err != nil {
-				return newError("failed to set SO_KEEPALIVE", err)
+				return errors.New("failed to set SO_KEEPALIVE", err)
 			}
 		} else if config.TcpKeepAliveIdle < 0 {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 0); err != nil {
-				return newError("failed to unset SO_KEEPALIVE", err)
-			}
-		}
-		if config.TcpNoDelay {
-			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
-				return newError("failed to set TCP_NODELAY", err)
+				return errors.New("failed to unset SO_KEEPALIVE", err)
 			}
 		}
 	}
@@ -76,12 +79,18 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 		}
 		if config.TcpKeepAliveIdle > 0 {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1); err != nil {
-				return newError("failed to set SO_KEEPALIVE", err)
+				return errors.New("failed to set SO_KEEPALIVE", err)
 			}
 		} else if config.TcpKeepAliveIdle < 0 {
 			if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 0); err != nil {
-				return newError("failed to unset SO_KEEPALIVE", err)
+				return errors.New("failed to unset SO_KEEPALIVE", err)
 			}
+		}
+	}
+
+	if config.V6Only {
+		if err := syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1); err != nil {
+			return errors.New("failed to set IPV6_V6ONLY").Base(err)
 		}
 	}
 

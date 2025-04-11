@@ -12,16 +12,16 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 type Interface interface {
 	net.Conn
 	HandshakeContext(ctx context.Context) error
 	VerifyHostname(host string) error
-	NegotiatedProtocol() (name string, mutual bool)
+	HandshakeContextServerName(ctx context.Context) string
+	NegotiatedProtocol() string
 }
 
 var _ buf.Writer = (*Conn)(nil)
+var _ Interface = (*Conn)(nil)
 
 type Conn struct {
 	*tls.Conn
@@ -44,20 +44,16 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return err
 }
 
-func (c *Conn) HandshakeAddressContext(ctx context.Context) net.Address {
+func (c *Conn) HandshakeContextServerName(ctx context.Context) string {
 	if err := c.HandshakeContext(ctx); err != nil {
-		return nil
+		return ""
 	}
-	state := c.ConnectionState()
-	if state.ServerName == "" {
-		return nil
-	}
-	return net.ParseAddress(state.ServerName)
+	return c.ConnectionState().ServerName
 }
 
-func (c *Conn) NegotiatedProtocol() (name string, mutual bool) {
+func (c *Conn) NegotiatedProtocol() string {
 	state := c.ConnectionState()
-	return state.NegotiatedProtocol, state.NegotiatedProtocolIsMutual
+	return state.NegotiatedProtocol
 }
 
 // Client initiates a TLS client handshake on the given connection.
@@ -76,6 +72,8 @@ type UConn struct {
 	*utls.UConn
 }
 
+var _ Interface = (*UConn)(nil)
+
 func (c *UConn) Close() error {
 	timer := time.AfterFunc(tlsCloseTimeout, func() {
 		c.Conn.NetConn().Close()
@@ -84,15 +82,11 @@ func (c *UConn) Close() error {
 	return c.Conn.Close()
 }
 
-func (c *UConn) HandshakeAddressContext(ctx context.Context) net.Address {
+func (c *UConn) HandshakeContextServerName(ctx context.Context) string {
 	if err := c.HandshakeContext(ctx); err != nil {
-		return nil
+		return ""
 	}
-	state := c.ConnectionState()
-	if state.ServerName == "" {
-		return nil
-	}
-	return net.ParseAddress(state.ServerName)
+	return c.ConnectionState().ServerName
 }
 
 // WebsocketHandshake basically calls UConn.Handshake inside it but it will only send
@@ -122,9 +116,9 @@ func (c *UConn) WebsocketHandshakeContext(ctx context.Context) error {
 	return c.HandshakeContext(ctx)
 }
 
-func (c *UConn) NegotiatedProtocol() (name string, mutual bool) {
+func (c *UConn) NegotiatedProtocol() string {
 	state := c.ConnectionState()
-	return state.NegotiatedProtocol, state.NegotiatedProtocolIsMutual
+	return state.NegotiatedProtocol
 }
 
 func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) net.Conn {
@@ -134,6 +128,7 @@ func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) ne
 
 func copyConfig(c *tls.Config) *utls.Config {
 	return &utls.Config{
+		Rand:                  c.Rand,
 		RootCAs:               c.RootCAs,
 		ServerName:            c.ServerName,
 		InsecureSkipVerify:    c.InsecureSkipVerify,
@@ -156,15 +151,19 @@ func init() {
 	weights := utls.DefaultWeights
 	weights.TLSVersMax_Set_VersionTLS13 = 1
 	weights.FirstKeyShare_Set_CurveP256 = 0
-	randomized := utls.HelloRandomized
+	randomized := utls.HelloRandomizedALPN
 	randomized.Seed, _ = utls.NewPRNGSeed()
 	randomized.Weights = &weights
+	randomizednoalpn := utls.HelloRandomizedNoALPN
+	randomizednoalpn.Seed, _ = utls.NewPRNGSeed()
+	randomizednoalpn.Weights = &weights
 	PresetFingerprints["randomized"] = &randomized
+	PresetFingerprints["randomizednoalpn"] = &randomizednoalpn
 }
 
 func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 	if name == "" {
-		return
+		return &utls.HelloChrome_Auto
 	}
 	if fingerprint = PresetFingerprints[name]; fingerprint != nil {
 		return
@@ -180,16 +179,18 @@ func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 
 var PresetFingerprints = map[string]*utls.ClientHelloID{
 	// Recommended preset options in GUI clients
-	"chrome":     &utls.HelloChrome_Auto,
-	"firefox":    &utls.HelloFirefox_Auto,
-	"safari":     &utls.HelloSafari_Auto,
-	"ios":        &utls.HelloIOS_Auto,
-	"android":    &utls.HelloAndroid_11_OkHttp,
-	"edge":       &utls.HelloEdge_Auto,
-	"360":        &utls.Hello360_Auto,
-	"qq":         &utls.HelloQQ_Auto,
-	"random":     nil,
-	"randomized": nil,
+	"chrome":           &utls.HelloChrome_Auto,
+	"firefox":          &utls.HelloFirefox_Auto,
+	"safari":           &utls.HelloSafari_Auto,
+	"ios":              &utls.HelloIOS_Auto,
+	"android":          &utls.HelloAndroid_11_OkHttp,
+	"edge":             &utls.HelloEdge_Auto,
+	"360":              &utls.Hello360_Auto,
+	"qq":               &utls.HelloQQ_Auto,
+	"random":           nil,
+	"randomized":       nil,
+	"randomizednoalpn": nil,
+	"unsafe":           nil,
 }
 
 var ModernFingerprints = map[string]*utls.ClientHelloID{
@@ -197,12 +198,14 @@ var ModernFingerprints = map[string]*utls.ClientHelloID{
 	"hellofirefox_99":         &utls.HelloFirefox_99,
 	"hellofirefox_102":        &utls.HelloFirefox_102,
 	"hellofirefox_105":        &utls.HelloFirefox_105,
+	"hellofirefox_120":        &utls.HelloFirefox_120,
 	"hellochrome_83":          &utls.HelloChrome_83,
 	"hellochrome_87":          &utls.HelloChrome_87,
 	"hellochrome_96":          &utls.HelloChrome_96,
 	"hellochrome_100":         &utls.HelloChrome_100,
 	"hellochrome_102":         &utls.HelloChrome_102,
 	"hellochrome_106_shuffle": &utls.HelloChrome_106_Shuffle,
+	"hellochrome_120":         &utls.HelloChrome_120,
 	"helloios_13":             &utls.HelloIOS_13,
 	"helloios_14":             &utls.HelloIOS_14,
 	"helloedge_85":            &utls.HelloEdge_85,

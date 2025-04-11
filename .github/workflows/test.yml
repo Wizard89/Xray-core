@@ -2,20 +2,8 @@ name: Test
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/*.yml"
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - "**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/*.yml"
 
 jobs:
   test:
@@ -34,7 +22,7 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - name: Restore Cache
+      - name: Restore Geodat Cache
         uses: actions/cache/restore@v4
         with:
           path: resources

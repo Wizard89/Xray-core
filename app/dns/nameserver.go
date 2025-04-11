@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -20,22 +21,25 @@ type Server interface {
 	// Name of the Client.
 	Name() string
 	// QueryIP sends IP queries to its configured server.
-	QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns.IPOption, disableCache bool) ([]net.IP, error)
+	QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns.IPOption, disableCache bool) ([]net.IP, uint32, error)
 }
 
 // Client is the interface for DNS client.
 type Client struct {
-	server       Server
-	clientIP     net.IP
-	skipFallback bool
-	domains      []string
-	expectIPs    []*router.GeoIPMatcher
+	server             Server
+	clientIP           net.IP
+	skipFallback       bool
+	domains            []string
+	expectedIPs        []*router.GeoIPMatcher
+	allowUnexpectedIPs bool
+	tag                string
+	timeoutMs          time.Duration
 }
 
-var errExpectedIPNonMatch = errors.New("expectIPs not match")
+var errExpectedIPNonMatch = errors.New("expectedIPs not match")
 
 // NewServer creates a name server object according to the network destination url.
-func NewServer(dest net.Destination, dispatcher routing.Dispatcher, queryStrategy QueryStrategy) (Server, error) {
+func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, queryStrategy QueryStrategy) (Server, error) {
 	if address := dest.Address; address.Family().IsDomain() {
 		u, err := url.Parse(address.Domain())
 		if err != nil {
@@ -43,11 +47,15 @@ func NewServer(dest net.Destination, dispatcher routing.Dispatcher, queryStrateg
 		}
 		switch {
 		case strings.EqualFold(u.String(), "localhost"):
-			return NewLocalNameServer(), nil
-		case strings.EqualFold(u.Scheme, "https"): // DOH Remote mode
-			return NewDoHNameServer(u, dispatcher, queryStrategy)
-		case strings.EqualFold(u.Scheme, "https+local"): // DOH Local mode
-			return NewDoHLocalNameServer(u, queryStrategy), nil
+			return NewLocalNameServer(queryStrategy), nil
+		case strings.EqualFold(u.Scheme, "https"): // DNS-over-HTTPS Remote mode
+			return NewDoHNameServer(u, queryStrategy, dispatcher, false), nil
+		case strings.EqualFold(u.Scheme, "h2c"): // DNS-over-HTTPS h2c Remote mode
+			return NewDoHNameServer(u, queryStrategy, dispatcher, true), nil
+		case strings.EqualFold(u.Scheme, "https+local"): // DNS-over-HTTPS Local mode
+			return NewDoHNameServer(u, queryStrategy, nil, false), nil
+		case strings.EqualFold(u.Scheme, "h2c+local"): // DNS-over-HTTPS h2c Local mode
+			return NewDoHNameServer(u, queryStrategy, nil, true), nil
 		case strings.EqualFold(u.Scheme, "quic+local"): // DNS-over-QUIC Local mode
 			return NewQUICNameServer(u, queryStrategy)
 		case strings.EqualFold(u.Scheme, "tcp"): // DNS-over-TCP Remote mode
@@ -55,16 +63,20 @@ func NewServer(dest net.Destination, dispatcher routing.Dispatcher, queryStrateg
 		case strings.EqualFold(u.Scheme, "tcp+local"): // DNS-over-TCP Local mode
 			return NewTCPLocalNameServer(u, queryStrategy)
 		case strings.EqualFold(u.String(), "fakedns"):
-			return NewFakeDNSServer(), nil
+			var fd dns.FakeDNSEngine
+			core.RequireFeatures(ctx, func(fdns dns.FakeDNSEngine) {
+				fd = fdns
+			})
+			return NewFakeDNSServer(fd), nil
 		}
 	}
 	if dest.Network == net.Network_Unknown {
 		dest.Network = net.Network_UDP
 	}
 	if dest.Network == net.Network_UDP { // UDP classic DNS mode
-		return NewClassicNameServer(dest, dispatcher), nil
+		return NewClassicNameServer(dest, dispatcher, queryStrategy), nil
 	}
-	return nil, newError("No available name server could be created from ", dest).AtWarning()
+	return nil, errors.New("No available name server could be created from ", dest).AtWarning()
 }
 
 // NewClient creates a DNS client managing a name server with client IP, domain rules and expected IPs.
@@ -80,17 +92,17 @@ func NewClient(
 
 	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
 		// Create a new server for each client for now
-		server, err := NewServer(ns.Address.AsDestination(), dispatcher, ns.GetQueryStrategy())
+		server, err := NewServer(ctx, ns.Address.AsDestination(), dispatcher, ns.GetQueryStrategy())
 		if err != nil {
-			return newError("failed to create nameserver").Base(err).AtWarning()
+			return errors.New("failed to create nameserver").Base(err).AtWarning()
 		}
 
-		// Priotize local domains with specific TLDs or without any dot to local DNS
+		// Prioritize local domains with specific TLDs or those without any dot for the local DNS
 		if _, isLocalDNS := server.(*LocalNameServer); isLocalDNS {
 			ns.PrioritizedDomain = append(ns.PrioritizedDomain, localTLDsAndDotlessDomains...)
 			ns.OriginalRules = append(ns.OriginalRules, localTLDsAndDotlessDomainsRule)
 			// The following lines is a solution to avoid core panics（rule index out of range） when setting `localhost` DNS client in config.
-			// Because the `localhost` DNS client will apend len(localTLDsAndDotlessDomains) rules into matcherInfos to match `geosite:private` default rule.
+			// Because the `localhost` DNS client will append len(localTLDsAndDotlessDomains) rules into matcherInfos to match `geosite:private` default rule.
 			// But `matcherInfos` has no enough length to add rules, which leads to core panics (rule index out of range).
 			// To avoid this, the length of `matcherInfos` must be equal to the expected, so manually append it with Golang default zero value first for later modification.
 			// Related issues:
@@ -111,7 +123,7 @@ func NewClient(
 		for _, domain := range ns.PrioritizedDomain {
 			domainRule, err := toStrMatcher(domain.Type, domain.Domain)
 			if err != nil {
-				return newError("failed to create prioritized domain").Base(err).AtWarning()
+				return errors.New("failed to create prioritized domain").Base(err).AtWarning()
 			}
 			originalRuleIdx := ruleCurr
 			if ruleCurr < len(ns.OriginalRules) {
@@ -130,7 +142,7 @@ func NewClient(
 			}
 			err = updateDomainRule(domainRule, originalRuleIdx, *matcherInfos)
 			if err != nil {
-				return newError("failed to create prioritized domain").Base(err).AtWarning()
+				return errors.New("failed to create prioritized domain").Base(err).AtWarning()
 			}
 		}
 
@@ -139,7 +151,7 @@ func NewClient(
 		for _, geoip := range ns.Geoip {
 			matcher, err := container.Add(geoip)
 			if err != nil {
-				return newError("failed to create ip matcher").Base(err).AtWarning()
+				return errors.New("failed to create ip matcher").Base(err).AtWarning()
 			}
 			matchers = append(matchers, matcher)
 		}
@@ -147,44 +159,27 @@ func NewClient(
 		if len(clientIP) > 0 {
 			switch ns.Address.Address.GetAddress().(type) {
 			case *net.IPOrDomain_Domain:
-				newError("DNS: client ", ns.Address.Address.GetDomain(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
+				errors.LogInfo(ctx, "DNS: client ", ns.Address.Address.GetDomain(), " uses clientIP ", clientIP.String())
 			case *net.IPOrDomain_Ip:
-				newError("DNS: client ", ns.Address.Address.GetIp(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
+				errors.LogInfo(ctx, "DNS: client ", ns.Address.Address.GetIp(), " uses clientIP ", clientIP.String())
 			}
 		}
 
+		var timeoutMs = 4000 * time.Millisecond
+		if ns.TimeoutMs > 0 {
+			timeoutMs = time.Duration(ns.TimeoutMs) * time.Millisecond
+		}
+		
 		client.server = server
 		client.clientIP = clientIP
 		client.skipFallback = ns.SkipFallback
 		client.domains = rules
-		client.expectIPs = matchers
+		client.expectedIPs = matchers
+		client.allowUnexpectedIPs = ns.AllowUnexpectedIPs
+		client.tag = ns.Tag
+		client.timeoutMs = timeoutMs
 		return nil
 	})
-	return client, err
-}
-
-// NewSimpleClient creates a DNS client with a simple destination.
-func NewSimpleClient(ctx context.Context, endpoint *net.Endpoint, clientIP net.IP) (*Client, error) {
-	client := &Client{}
-	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
-		server, err := NewServer(endpoint.AsDestination(), dispatcher, QueryStrategy_USE_IP)
-		if err != nil {
-			return newError("failed to create nameserver").Base(err).AtWarning()
-		}
-		client.server = server
-		client.clientIP = clientIP
-		return nil
-	})
-
-	if len(clientIP) > 0 {
-		switch endpoint.Address.GetAddress().(type) {
-		case *net.IPOrDomain_Domain:
-			newError("DNS: client ", endpoint.Address.GetDomain(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
-		case *net.IPOrDomain_Ip:
-			newError("DNS: client ", endpoint.Address.GetIp(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
-		}
-	}
-
 	return client, err
 }
 
@@ -194,25 +189,33 @@ func (c *Client) Name() string {
 }
 
 // QueryIP sends DNS query to the name server with the client's IP.
-func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption, disableCache bool) ([]net.IP, error) {
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	ips, err := c.server.QueryIP(ctx, domain, c.clientIP, option, disableCache)
+func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption, disableCache bool) ([]net.IP, uint32, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeoutMs)
+	if len(c.tag) != 0 {
+		content := session.InboundFromContext(ctx)
+		errors.LogDebug(ctx, "DNS: client override tag from ", content.Tag, " to ", c.tag)
+		// create a new context to override the tag
+		// do not direct set *content.Tag, it might be used by other clients
+		ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
+	}
+	ips, ttl, err := c.server.QueryIP(ctx, domain, c.clientIP, option, disableCache)
 	cancel()
 
 	if err != nil {
-		return ips, err
+		return ips, ttl, err
 	}
-	return c.MatchExpectedIPs(domain, ips)
+	netips, err := c.MatchExpectedIPs(domain, ips)
+	return netips, ttl, err
 }
 
 // MatchExpectedIPs matches queried domain IPs with expected IPs and returns matched ones.
 func (c *Client) MatchExpectedIPs(domain string, ips []net.IP) ([]net.IP, error) {
-	if len(c.expectIPs) == 0 {
+	if len(c.expectedIPs) == 0 {
 		return ips, nil
 	}
 	newIps := []net.IP{}
 	for _, ip := range ips {
-		for _, matcher := range c.expectIPs {
+		for _, matcher := range c.expectedIPs {
 			if matcher.Match(ip) {
 				newIps = append(newIps, ip)
 				break
@@ -220,9 +223,12 @@ func (c *Client) MatchExpectedIPs(domain string, ips []net.IP) ([]net.IP, error)
 		}
 	}
 	if len(newIps) == 0 {
+		if c.allowUnexpectedIPs {
+			return ips, nil
+		}
 		return nil, errExpectedIPNonMatch
 	}
-	newError("domain ", domain, " expectIPs ", newIps, " matched at server ", c.Name()).AtDebug().WriteToLog()
+	errors.LogDebug(context.Background(), "domain ", domain, " expectedIPs ", newIps, " matched at server ", c.Name())
 	return newIps, nil
 }
 
